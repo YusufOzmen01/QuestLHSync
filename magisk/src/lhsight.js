@@ -28,6 +28,7 @@ var cm = new CModule(`@CSRC@`, { clock_gettime: g("clock_gettime"), memcpy: g("m
 var F = function (n, r, a) { return new NativeFunction(cm[n], r, a); };
 var add_slot = F("add_slot", "void", ["pointer", "int", "int", "int"]);
 var set_bufs = F("set_bufs", "void", ["pointer", "pointer", "pointer", "pointer", "int"]);
+var set_runs = F("set_runs", "void", ["pointer", "pointer", "pointer", "pointer", "pointer", "pointer", "pointer"]);
 var prime = F("prime", "void", []), poll = F("poll", "int", []), reset_slots = F("reset_slots", "void", []);
 var drain = F("drain", "int", ["pointer", "int"]);
 var n_drop = F("n_drop", "uint", []), scan_ns = F("scan_ns", "uint64", []), n_scan = F("n_scan", "uint", []);
@@ -36,6 +37,12 @@ var scratchBuf = Memory.alloc(MAXW * MAXH), cellBuf = Memory.alloc((MAXW >> 4) *
 var labBuf = Memory.alloc((MAXW >> 4) * (MAXH >> 4) * 4);
 var outBuf = Memory.alloc(1 << 20), drainBuf = Memory.alloc(1 << 16), tsBuf = Memory.alloc(16);
 set_bufs(scratchBuf, cellBuf, labBuf, outBuf, 64);
+// the pixel-exact saturated pass (lhsight.c sat_blobs): RUNMAX runs
+var RUNMAX = 16384;
+var runBuf = Memory.alloc(RUNMAX * 6), rlabBuf = Memory.alloc(RUNMAX * 4), rrowBuf = Memory.alloc((MAXH + 1) * 4);
+var rsxBuf = Memory.alloc(RUNMAX * 8), rsyBuf = Memory.alloc(RUNMAX * 8), rnpBuf = Memory.alloc(RUNMAX * 4);
+var rbiBuf = Memory.alloc(RUNMAX * 4);
+set_runs(runBuf, rlabBuf, rrowBuf, rsxBuf, rsyBuf, rnpBuf, rbiBuf);
 var PAGE = 4096;
 function bufSize(c) { return Math.ceil(c.w * c.h / PAGE) * PAGE; }  // one 8-bit frame, whole pages
 function discover() {

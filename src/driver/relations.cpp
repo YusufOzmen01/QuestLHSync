@@ -1,4 +1,10 @@
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
+#endif
 
 #include "relations.h"
 
@@ -9,8 +15,13 @@
 #include <fstream>
 #include <sstream>
 
-#include "MinHook.h"
 #include "json.h"
+#include "platform.h"
+#ifdef _WIN32
+#include "MinHook.h"
+#else
+#include "../linux/shim/inline_hook.h"
+#endif
 
 namespace {
 
@@ -22,16 +33,18 @@ constexpr size_t kKeepRel = 30;                     // the newest relationships 
 constexpr int kSayPerMin = 10;                      // log lines a minute at most
 constexpr uint64_t kSaveMs = 10000;                 // relations.json written at most this often
 
-// the relationship step's log line, and its arguments as it takes them: mov r13, r9 (the pose); mov r15d, r8d and
-// mov r12d, edx (the two stations' serials)
+// the relationship step's log line
 const char kMoving[] = "Moving base %08X %.0fmm and %.1f deg because of relationship with %08X";
+Relations *g_self;
+
+#ifdef _WIN32
+// its arguments as it takes them: mov r13, r9 (the pose); mov r15d, r8d and mov r12d, edx (the two stations' serials)
 const uint8_t kArgs[] = {0x4D, 0x8B, 0xE9, 0x45, 0x8B, 0xF8, 0x44, 0x8B, 0xE2};
 
 // (this, a, b, rel, variance) as it takes them, with room for arguments a later version might add: each one, and what
 // it returns, passed on bit for bit
 using RelFn = uint64_t (*)(void *, uint64_t, uint64_t, const float *, uint64_t, uint64_t, uint64_t, uint64_t);
 RelFn g_orig;
-Relations *g_self;
 
 uint64_t Detour(void *self, uint64_t a, uint64_t b, const float *rel, uint64_t s5, uint64_t s6, uint64_t s7,
                 uint64_t s8) {
@@ -43,6 +56,100 @@ uint64_t Detour(void *self, uint64_t a, uint64_t b, const float *rel, uint64_t s
   }
   return g_orig(self, a, b, use ? avg : rel, s5, s6, s7, s8);
 }
+#else
+// The Linux build (System V ABI) takes (this, a, b, variance, rel): this, a, b in rdi, esi, edx, the variance in
+// xmm0 and the pose, 7 floats, by value on the stack; what it returns isn't used. The integer registers it doesn't
+// take, and the pose, are passed on bit for bit
+struct Rel7 { float f[7]; };
+using RelFn = void (*)(void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, float, Rel7);
+RelFn g_orig;
+InlineHook g_hook;
+
+void Detour(void *self, uint64_t a, uint64_t b, uint64_t r3, uint64_t r4, uint64_t r5, float var, Rel7 rel) {
+  Rel7 avg;
+  bool use = false;
+  try {
+    use = g_self && g_self->Average((uint32_t)a, (uint32_t)b, rel.f, avg.f);
+  } catch (...) {
+  }
+  g_orig(self, a, b, r3, r4, r5, var, use ? avg : rel);
+}
+
+// the loaded driver_lighthouse.so: its base, program headers and name
+struct Image { uintptr_t base = 0; const ElfW(Phdr) *ph = nullptr; int nph = 0; };
+
+int FindImage(dl_phdr_info *info, size_t, void *data) {
+  auto *img = (Image *)data;
+  const char *n = info->dlpi_name;
+  if (!n || !strstr(n, "driver_lighthouse.so")) return 0;
+  Dl_info me;
+  link_map *lm = nullptr;  // the shim takes driver_lighthouse.so's name in QuestLHSync's SteamVR tree: not it
+  if (dladdr1((void *)&FindImage, &me, (void **)&lm, RTLD_DL_LINKMAP) && lm && lm->l_addr == info->dlpi_addr) return 0;
+  img->base = info->dlpi_addr;
+  img->ph = info->dlpi_phdr;
+  img->nph = info->dlpi_phnum;
+  return 1;
+}
+
+// a DWARF pointer (.eh_frame's encodings: absptr, udata/sdata 4 and 8; pcrel and datarel)
+bool ReadEnc(const uint8_t *&p, uint8_t enc, uintptr_t datarel, uintptr_t &out) {
+  if (enc == 0xFF) return false;
+  const uint8_t *at = p;
+  int64_t v;
+  switch (enc & 0x0F) {
+    case 0x00: { uint64_t u; memcpy(&u, p, 8); v = (int64_t)u; p += 8; break; }
+    case 0x03: { uint32_t u; memcpy(&u, p, 4); v = u; p += 4; break; }
+    case 0x0B: { int32_t u; memcpy(&u, p, 4); v = u; p += 4; break; }
+    case 0x04: case 0x0C: { int64_t u; memcpy(&u, p, 8); v = u; p += 8; break; }
+    default: return false;
+  }
+  switch (enc & 0x70) {
+    case 0x00: break;
+    case 0x10: v += (int64_t)(uintptr_t)at; break;
+    case 0x30: v += (int64_t)datarel; break;
+    default: return false;
+  }
+  out = (uintptr_t)v;
+  return true;
+}
+
+uint64_t Uleb(const uint8_t *&p) {
+  uint64_t r = 0;
+  for (int s = 0;; s += 7) { uint8_t b = *p++; r |= (uint64_t)(b & 0x7F) << s; if (!(b & 0x80)) break; }
+  return r;
+}
+
+// the FDE's function range, its pc_begin encoded as its CIE says (augmentation 'R')
+bool FdeRange(const uint8_t *fde, uintptr_t &begin, uintptr_t &end) {
+  uint32_t len;
+  memcpy(&len, fde, 4);
+  if (len == 0 || len == 0xFFFFFFFFu) return false;
+  int32_t cie_off;
+  memcpy(&cie_off, fde + 4, 4);
+  const uint8_t *cie = fde + 4 - cie_off, *c = cie + 8;
+  uint8_t ver = *c++;
+  const char *aug = (const char *)c;
+  c += strlen(aug) + 1;
+  Uleb(c);  // code alignment
+  Uleb(c);  // data alignment (sleb: only skipped)
+  if (ver == 1) c++; else Uleb(c);  // return register
+  uint8_t enc = 0;  // absptr
+  if (aug[0] == 'z') {
+    Uleb(c);
+    for (const char *a = aug + 1; *a; a++) {
+      if (*a == 'R') enc = *c++;
+      else if (*a == 'L') c++;
+      else if (*a == 'P') { uint8_t pe = *c++; uintptr_t skip; if (!ReadEnc(c, pe & 0x7F, 0, skip)) return false; }
+      else if (*a != 'S' && *a != 'B') return false;
+    }
+  }
+  const uint8_t *q = fde + 8;
+  uintptr_t range;
+  if (!ReadEnc(q, enc, 0, begin) || !ReadEnc(q, enc & 0x0F, 0, range)) return false;
+  end = begin + range;
+  return true;
+}
+#endif
 
 std::string Fmt(const char *fmt, ...) {
   char buf[512];
@@ -90,6 +197,7 @@ Relations::Pose Relations::Mean(const std::vector<Pose> &v) {
   return {{s.w / n, s.x / n, s.y / n, s.z / n}, t * (1.0 / v.size())};
 }
 
+#ifdef _WIN32
 void *Relations::Find(void *module, std::string &why) {
   auto *base = (uint8_t *)module;
   auto *dos = (IMAGE_DOS_HEADER *)base;
@@ -171,6 +279,105 @@ bool Relations::Hook() {
 void Relations::Unhook() {
   if (target_) MH_DisableHook(target_);
 }
+#else
+void *Relations::Find(void *module, std::string &why) {
+  const Image &img = *(const Image *)module;
+  // the log line in a segment that isn't code, then the code that loads it (lea r, [rip+d])
+  const uint8_t *str = nullptr, *ref = nullptr, *ehh = nullptr;
+  for (int i = 0; i < img.nph && !str; i++) {
+    const ElfW(Phdr) &ph = img.ph[i];
+    if (ph.p_type != PT_LOAD || (ph.p_flags & PF_X)) continue;
+    const uint8_t *p = (const uint8_t *)(img.base + ph.p_vaddr), *e = p + ph.p_memsz;
+    for (; p + sizeof kMoving <= e; p++)
+      if (*p == 'M' && !memcmp(p, kMoving, sizeof kMoving - 1)) { str = p; break; }
+  }
+  if (!str) { why = "no base station move in it"; return nullptr; }
+  for (int i = 0; i < img.nph && !ref; i++) {
+    const ElfW(Phdr) &ph = img.ph[i];
+    if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_X)) continue;
+    const uint8_t *p = (const uint8_t *)(img.base + ph.p_vaddr), *e = p + ph.p_memsz;
+    for (; p + 7 <= e; p++) {
+      if ((p[0] != 0x48 && p[0] != 0x4C) || p[1] != 0x8D || (p[2] & 0xC7) != 0x05) continue;
+      int32_t d;
+      memcpy(&d, p + 3, 4);
+      if (p + 7 + d == str) { ref = p; break; }
+    }
+  }
+  if (!ref) { why = "nothing loads its move line"; return nullptr; }
+  // the function around it, from the image's unwind table (.eh_frame_hdr: functions' starts, sorted)
+  for (int i = 0; i < img.nph; i++)
+    if (img.ph[i].p_type == PT_GNU_EH_FRAME) ehh = (const uint8_t *)(img.base + img.ph[i].p_vaddr);
+  if (!ehh || ehh[0] != 1 || ehh[3] != 0x3B) { why = "no unwind table to find its move's function"; return nullptr; }
+  const uint8_t *q = ehh + 4;
+  uintptr_t frame, count;
+  if (!ReadEnc(q, ehh[1], (uintptr_t)ehh, frame) || !ReadEnc(q, ehh[2], (uintptr_t)ehh, count)) {
+    why = "an unwind table it can't read";
+    return nullptr;
+  }
+  auto *tab = (const int32_t *)q;  // (start, fde) pairs, relative to .eh_frame_hdr
+  uintptr_t at = (uintptr_t)ref, fn = 0;
+  size_t lo = 0, hi = count;
+  while (lo < hi) {  // the last start <= at
+    size_t mid = (lo + hi) / 2;
+    if ((uintptr_t)ehh + tab[2 * mid] <= at) lo = mid + 1; else hi = mid;
+  }
+  if (lo) {
+    uintptr_t begin, end;
+    const uint8_t *fde = ehh + tab[2 * (lo - 1) + 1];
+    if (FdeRange(fde, begin, end) && begin <= at && at < end) fn = begin;
+  }
+  if (!fn) { why = "no unwind entry for its move"; return nullptr; }
+  // (this, a, b, variance, rel): its first instructions take the pose's 7 floats off the stack, movss xmm,
+  // [rbp+0x10] .. [rbp+0x28]
+  auto *code = (const uint8_t *)fn;
+  int got = 0;
+  for (int off = 0x10; off <= 0x28; off += 4)
+    for (int k = 0; k < 0xA0; k++) {
+      const uint8_t *m = code + k;
+      if (m[0] != 0xF3) continue;
+      const uint8_t *o = m + 1;
+      if ((*o & 0xF0) == 0x40) o++;  // REX
+      if (o[0] == 0x0F && o[1] == 0x10 && (o[2] & 0xC7) == 0x45 && o[3] == off) { got++; break; }
+    }
+  if (got != 7) { why = "its relationship step takes other arguments"; return nullptr; }
+  return (void *)fn;
+}
+
+bool Relations::Hook() {
+  if (target_) return true;
+  Image img;
+  dl_iterate_phdr(&FindImage, &img);
+  if (!img.base) return false;
+  std::string why;
+  void *fn = Find(&img, why);
+  if (!fn) {
+    log_("SteamVR's lighthouse driver isn't one this version knows (" + why +
+         "): base stations placed as SteamVR places them");
+    return true;
+  }
+  g_self = this;
+  if (!HookCreate(fn, (void *)&Detour, g_hook, why)) {
+    log_("hooking SteamVR's base station placement failed (" + why +
+         "): base stations placed as SteamVR places them");
+    return true;
+  }
+  g_orig = (RelFn)g_hook.tramp;
+  target_ = fn;
+  size_t known = 0;
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (auto &kv : pairs_) known += kv.second.size();
+  }
+  log_(Fmt("base stations: SteamVR places them by the average of its measurements (%zu kept)", known));
+  return true;
+}
+
+void Relations::Unhook() {
+  // the hook stays in, passing each measurement on untouched: SteamVR's tracking thread may be in it right now
+  enabled_ = false;
+}
+
+#endif
 
 bool Relations::Average(uint32_t a, uint32_t b, const float rel[7], float out[7]) {
   if (!enabled_ || a == b || !a || !b) return false;
@@ -236,7 +443,7 @@ void Relations::Roll(uint64_t now) {
 }
 
 void Relations::Say(const std::string &s) {
-  Roll(GetTickCount64());
+  Roll(plat::TickMs());
   if (say_n_ < kSayPerMin) {
     said_.push_back(s);
     say_n_++;
@@ -250,7 +457,7 @@ void Relations::Flush(bool now) {
   std::vector<std::string> said;
   {
     std::lock_guard<std::mutex> g(m_);
-    uint64_t t = GetTickCount64();
+    uint64_t t = plat::TickMs();
     Roll(t);
     if (dirty_ && (now || t - saved_t_ >= kSaveMs)) {
       s = Json();
@@ -261,16 +468,16 @@ void Relations::Flush(bool now) {
   }
   for (auto &l : said) log_(l);
   if (s.empty()) return;
-  std::string path = dir_ + "\\relations.json", tmp = path + ".tmp";
+  std::string path = plat::Join(dir_, "relations.json"), tmp = path + ".tmp";
   FILE *f = fopen(tmp.c_str(), "wb");
   if (!f) return;
   fwrite(s.data(), 1, s.size(), f);
   fclose(f);
-  MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+  plat::Replace(tmp, path);
 }
 
 void Relations::Load() {
-  std::ifstream f(dir_ + "\\relations.json", std::ios::binary);
+  std::ifstream f(plat::Join(dir_, "relations.json"), std::ios::binary);
   if (!f) return;
   std::stringstream ss;
   ss << f.rdbuf();

@@ -29,6 +29,8 @@ headset module.
 - **SteamVR base stations**, 1.0 or 2.0.
 - **Windows with SteamVR**, with the headset streamed by anything: Steam Link,
   Link, Air Link, Virtual Desktop, ALVR, CreoleCast...
+- Or **Linux with [WiVRn](https://github.com/WiVRn/WiVRn)** (or Monado) and its
+  SteamVR lighthouse driver: see [Linux](#linux-wivrn--monado).
 - The PC and the headset on the **same local network**.
 - At least **one lighthouse device switched on** (a tracker or an Index
   controller). SteamVR only shows base stations while one is on.
@@ -145,6 +147,53 @@ With a wired headset (SteamVR's headset is a lighthouse one, or tracked by a dri
 - **"Finding the base stations" for a long time:** face each base station for a
   few seconds.
 
+## Linux (WiVRn / Monado)
+
+The same alignment, for WiVRn or Monado with their SteamVR lighthouse driver
+(WiVRn's `use-steamvr-lh`, Monado's `STEAMVR_LH_ENABLE`). The headset part is
+the same; the PC part is three pieces, installed for your user:
+
+- **the lighthouse shim**, which the runtime loads as SteamVR's lighthouse
+  driver. Monado's lighthouse driver drops the base stations and keeps the raw
+  lighthouse poses to itself. The shim keeps the base stations for QuestLHSync,
+  passes the raw poses of controllers and trackers on, hides them until they're
+  placed, and averages SteamVR's base station placement, as the Windows driver
+  does. It comes from QuestLHSync's SteamVR tree
+  (`~/.local/share/QuestLHSync/steamvr`: links to your SteamVR, with the shim in
+  place of `driver_lighthouse.so`), which the runtime is pointed at with
+  `STEAMVR_PATH`.
+- **`questlhsync`**, a user service. It finds the headset, solves the alignment
+  and applies it as the lighthouse tracking origin's offset, the way
+  [motoc](https://github.com/galister/motoc) applies a calibration. It also
+  levels by gravity and records sessions. Don't run motoc's calibration (or
+  anything else that moves the lighthouse origin) alongside it.
+- **`questlhsync-dashboard`**, the same status page in a desktop window
+  (WayVR or any desktop overlay shows it in the headset). The service opens it;
+  it's also in your applications menu as QuestLHSync.
+
+Install, from a clone (needs cmake, a C++17 compiler, the OpenXR loader, GTK 3,
+and SteamVR installed through Steam for its lighthouse driver):
+
+```
+./install-linux.sh
+```
+
+Then start WiVRn with `STEAMVR_PATH` set to the tree. The script sets it for
+WiVRn's user service right away, and for the whole session (WiVRn's dashboard,
+Envision, terminals) from your next login. In Envision, add it to the profile's
+environment variables. `questlhsync --setup` prints the path.
+`./install-linux.sh uninstall` removes it all.
+
+Settings go in `~/.config/questlhsync/settings.json`, with the same keys as
+`driver_questlhsync` (for example `{"host": "192.168.1.50"}`). Data and the log
+(`questlhsync.log`) are in `~/.local/share/QuestLHSync`, laid out as on
+Windows. Levelling by gravity reads the lighthouse receivers' `/dev/hidraw`
+nodes, which Steam's udev rules (`steam-devices`) open to your user.
+
+With a lighthouse headset (Index, Vive) or one Monado drives itself, QuestLHSync
+switches itself off, as on Windows. The Steam Frame streams through SteamVR
+only, so on Linux it's the Quests.
+
 ## Privacy and security
 
 The PC side writes only to `%LOCALAPPDATA%\QuestLHSync` and only talks to the
@@ -178,6 +227,9 @@ python release.py                the release files, into out\release-<version>\
 python install.py                register driver\questlhsync with SteamVR
 python install.py headset        install the module over adb, no reboot
 ```
+
+On Linux, `cmake -S . -B build/linux && cmake --build build/linux` builds the
+Linux side (`install-linux.sh` does it and installs it); see `CMakeLists.txt`.
 
 Zig cross-compiles the Steam Frame package (`zig` on PATH, or `ZIG` set to it).
 On the Frame itself or any arm64 Linux, `frame/build.py` uses `cc` and `c++`

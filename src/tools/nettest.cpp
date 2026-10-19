@@ -2,8 +2,14 @@
 // log, placed on this PC's clock where the fake headset's clock puts the camera frames.
 //   qlhs_nettest <log> --dir <state dir> [--start s] [--dur s] [--mem <headset.txt>] [--family "Quest 3"]
 // --family: SteamVR's HMD kind (default Quest Pro), to test that headsets of another kind are skipped
+#ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
+#else
+#include <unistd.h>
+static void Sleep(unsigned ms) { usleep(ms * 1000); }
+using DWORD = unsigned;
+#endif
 
 #include <atomic>
 #include <cstdio>

@@ -57,7 +57,7 @@ class HeadsetLink {
   bool Session(const Found &f);
 };
 
-double QpcNow();  // seconds, QueryPerformanceCounter
+double QpcNow();  // seconds: QueryPerformanceCounter (Windows), CLOCK_MONOTONIC (Linux)
 
 // "Quest Pro", "Quest 3" (the 3S too) or "Steam Frame" from a model name, device codename or serial, whatever spells
 // it ("Meta Quest Pro", "Oculus Quest 3", "CREOLECAST-QUEST3S", "eureka", "Deckard MP", ...); "" for anything else

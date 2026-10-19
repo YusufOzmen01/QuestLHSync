@@ -1,11 +1,18 @@
+#ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
 #include <setupapi.h>
 #include <shlobj.h>
+#else
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#endif
 
 #include "gravity.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -17,12 +24,15 @@
 
 #include "json.h"
 #include "net.h"
+#include "platform.h"
 
+#ifdef _WIN32
 extern "C" {
 void __stdcall HidD_GetHidGuid(GUID *guid);
 BOOLEAN __stdcall HidD_GetSerialNumberString(HANDLE device, PVOID buffer, ULONG length);
 BOOLEAN __stdcall HidD_SetNumInputBuffers(HANDLE device, ULONG n);
 }
+#endif
 
 namespace {
 constexpr double kKeepS = 20;                      // s of IMU samples and poses kept
@@ -77,7 +87,7 @@ std::string Fmt(const char *fmt, ...) {
 std::string Now() {
   time_t t = time(nullptr);
   struct tm tm;
-  localtime_s(&tm, &t);
+  plat::LocalTime(t, tm);
   char b[32];
   strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", &tm);
   return b;
@@ -163,16 +173,30 @@ double Interp(const std::vector<double> &t, const std::vector<double> &v, double
 
 Gravity::Gravity(std::string dir, LogFn log, bool live) : dir_(std::move(dir)), log_(std::move(log)), live_(live) {
   // SteamVR's config folder: each lighthouse device's config, with its IMU calibration
-  PWSTR p = nullptr;
   std::filesystem::path paths;
+#ifdef _WIN32
+  PWSTR p = nullptr;
   if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &p)))
     paths = std::filesystem::path(p) / "openvr" / "openvrpaths.vrpath";
   CoTaskMemFree(p);
+#else
+  const char *xc = getenv("XDG_CONFIG_HOME");
+  paths = (xc && *xc ? std::filesystem::path(xc) : std::filesystem::path(plat::Home()) / ".config") / "openvr" /
+          "openvrpaths.vrpath";
+#endif
   std::string text;
   JVal root;
   if (ReadText(paths.string(), text) && JParse(text, root))
     if (const JVal *a = root.get("config"))
       if (a->t == JVal::Arr && !a->a.empty() && a->a[0].t == JVal::Str) config_dir_ = a->a[0].s;
+#ifndef _WIN32
+  // without SteamVR's paths file (Monado's lighthouse driver doesn't need one): Steam's own config folder, where
+  // SteamVR's lighthouse driver keeps the device configs wherever it runs
+  std::error_code ec;
+  if (config_dir_.empty() || !std::filesystem::is_directory(std::filesystem::path(config_dir_) / "lighthouse", ec))
+    for (const char *c : {"/.steam/root/config", "/.steam/steam/config", "/.local/share/Steam/config"})
+      if (std::filesystem::is_directory(plat::Home() + c + "/lighthouse", ec)) { config_dir_ = plat::Home() + c; break; }
+#endif
   if (config_dir_.empty()) log_("gravity: no SteamVR config folder: levelling by gravity off");
   Load();
   if (live_) worker_ = std::thread(&Gravity::Worker, this);
@@ -231,6 +255,7 @@ bool Gravity::LoadConfig(Dev &d) {
   return true;
 }
 
+#ifdef _WIN32
 // the receiver's HID interface: Valve's (vid_28de) whose serial is the receiver's
 bool Gravity::FindPath(const std::string &receiver, std::wstring &path) {
   GUID guid;
@@ -311,10 +336,88 @@ void Gravity::ReadLoop(std::string receiver, Reader *rd) {
   CloseHandle(h);
   rd->done = true;
 }
+#else
+// the receiver's HID interfaces: Valve's (vendor 28de) whose serial (HID_UNIQ) is the receiver's, as /dev/hidraw nodes
+bool Gravity::FindPath(const std::string &receiver, std::vector<std::string> &paths) {
+  namespace fs = std::filesystem;
+  auto lower = [](std::string v) { for (char &c : v) c = (char)tolower((unsigned char)c); return v; };
+  std::string want = lower(receiver);
+  std::error_code ec;
+  for (auto &e : fs::directory_iterator("/sys/class/hidraw", ec)) {
+    std::string ue;
+    if (!ReadText((e.path() / "device" / "uevent").string(), ue)) continue;
+    std::string id, uniq;
+    std::istringstream ls(ue);
+    for (std::string l; std::getline(ls, l);) {
+      if (l.rfind("HID_ID=", 0) == 0) id = lower(l.substr(7));
+      if (l.rfind("HID_UNIQ=", 0) == 0) uniq = lower(l.substr(9));
+    }
+    if (id.find(":000028de:") == std::string::npos || uniq != want) continue;
+    paths.push_back("/dev/" + e.path().filename().string());
+  }
+  std::sort(paths.begin(), paths.end());
+  return !paths.empty();
+}
+
+// A receiver's input reports, read only (another reader of the same hidraw node, with its own queue: nothing is
+// sent). Reports: 0x23 one Watchman packet, 0x24 two (the second 29 bytes on). A packet: time MSB, size, time LSB,
+// then size - 1 bytes: Watchman v2 flags, and with 0x80 the IMU sample first: a time byte, accel xyz, gyro xyz (int16
+// LE). The sample's time: the packet's two bytes and its own, the top 24 bits of the device's 48 MHz clock.
+// libsurvive's driver_vive.c (survive_handle_watchman, handle_watchman_v2, read_imu_data).
+void Gravity::ReadLoop(std::string receiver, Reader *rd) {
+  std::vector<std::string> paths;
+  std::vector<pollfd> fds;
+  if (FindPath(receiver, paths))
+    for (auto &p : paths) {
+      int fd = open(p.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+      if (fd >= 0) fds.push_back({fd, POLLIN, 0});
+    }
+  if (fds.empty()) {
+    if (!paths.empty())
+      log_("gravity: can't read " + paths[0] + " (receiver " + receiver +
+           "): no permission? Steam's udev rules (steam-devices) give it to your user");
+    rd->done = true;
+    return;
+  }
+  unsigned char r[512];
+  bool gone = false;
+  while (run_ && enabled_ && !rd->stop && !gone) {
+    if (poll(fds.data(), fds.size(), 200) <= 0) continue;
+    for (auto &pf : fds) {
+      if (pf.revents & (POLLERR | POLLHUP | POLLNVAL)) { gone = true; break; }
+      if (!(pf.revents & POLLIN)) continue;
+      for (;;) {
+        ssize_t got = read(pf.fd, r, sizeof r);
+        if (got <= 0) break;
+        size_t n = (size_t)got;
+        double t = QpcNow();
+        if (n < 2 || (r[0] != 0x23 && r[0] != 0x24)) continue;
+        for (size_t off : {size_t(1), size_t(30)}) {
+          if (off == 30 && r[0] != 0x24) break;
+          if (off + 3 > n) break;
+          const unsigned char *p = r + off;
+          size_t size = p[1];
+          if (size < 15 || off + 3 + size - 1 > n) continue;
+          const unsigned char *pay = p + 3;
+          if (!(pay[0] & 0x80)) continue;
+          int16_t v[6];
+          for (int i = 0; i < 6; i++) v[i] = (int16_t)(pay[2 + 2 * i] | (pay[3 + 2 * i] << 8));
+          uint32_t tick = (uint32_t)p[0] << 24 | (uint32_t)p[2] << 16 | (uint32_t)pay[1] << 8;
+          OnImu(receiver, t, tick, v, v + 3);
+          rd->n++;
+        }
+      }
+    }
+  }
+  for (auto &pf : fds) close(pf.fd);
+  rd->done = true;
+}
+
+#endif
 
 void Gravity::Worker() {
   while (run_) {
-    Sleep(250);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
     if (config_dir_.empty()) continue;
     Process(QpcNow());
   }
@@ -831,7 +934,7 @@ void Gravity::Report(double now) {
 void Gravity::Load() {
   std::string text;
   JVal root;
-  if (!ReadText(dir_ + "\\gravity.json", text) || !JParse(text, root)) return;
+  if (!ReadText(plat::Join(dir_, "gravity.json"), text) || !JParse(text, root)) return;
   const JVal *offs = root.get("offsets");
   if (!offs || offs->t != JVal::Obj) return;
   for (auto &kv : offs->o) {
@@ -857,12 +960,12 @@ void Gravity::Save() {
     first = false;
   }
   s += "\n }\n}\n";
-  std::string path = dir_ + "\\gravity.json", tmp = path + ".tmp";
+  std::string path = plat::Join(dir_, "gravity.json"), tmp = path + ".tmp";
   FILE *f = fopen(tmp.c_str(), "wb");
   if (!f) return;
   fwrite(s.data(), 1, s.size(), f);
   fclose(f);
-  MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+  plat::Replace(tmp, path);
 }
 
 bool Gravity::Step(const Ref &ref, bool &on, M3 &tilt) {

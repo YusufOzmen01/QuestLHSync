@@ -1,11 +1,17 @@
-// QuestLHSync driver <-> dashboard overlay: shared memory "Local\QuestLHSync".
+// QuestLHSync driver <-> dashboard overlay: shared memory "Local\QuestLHSync" (Linux: the questlhsync app <->
+// questlhsync-dashboard, /dev/shm/questlhsync-status-<uid>).
 // The driver publishes its status under a seqlock (seq odd while writing); the overlay sends commands by
 // writing cmd and then incrementing cmd_seq.
 #pragma once
 #include <stdint.h>
 
+#ifdef _WIN32
 #define QLHS_SHM_NAME L"Local\\QuestLHSync"
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
+#else
+#define QLHS_SHM_PREFIX "/questlhsync-status-"         // + uid, shm_open
+#define QLHS_DASHBOARD_LOCK "questlhsync-dashboard.lock"  // in $XDG_RUNTIME_DIR, flock
+#endif
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
 #define QLHS_VERSION 2
 #define QLHS_RELEASE "1.24"  // magisk/build_module.py reads it
@@ -21,6 +27,8 @@ enum QlhsState : int32_t {
   QLHS_LOCKED,
   QLHS_DISABLED,     // driver_questlhsync.enable is false
   QLHS_WIRED,        // SteamVR's headset is wired, not streamed: the driver is off and the dashboard closes
+  QLHS_NO_RUNTIME,   // Linux: Monado / WiVRn isn't running (or has no headset yet)
+  QLHS_NO_SHIM,      // Linux: the runtime runs without QuestLHSync's lighthouse shim (STEAMVR_PATH not set)
 };
 
 enum QlhsCmd : int32_t {
