@@ -443,6 +443,9 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     auto c = vr::VRProperties()->TrackedDeviceToPropertyContainer(i);
     if (c == vr::k_ulInvalidPropertyContainer) return;
     std::string label = GetStr(c, vr::Prop_ModeLabel_String);
+    // a 1.0 base station ("HTC V2-XD/XE") has no 2.0 channel, whatever its label says (openhouse labels its
+    // multi-station slots "1".."4")
+    if (GetStr(c, vr::Prop_ModelNumber_String).rfind("HTC", 0) == 0) label.clear();
     int ch = 0;
     if (!label.empty() && std::all_of(label.begin(), label.end(), [](char x) { return isdigit((unsigned char)x); }))
       ch = atoi(label.c_str());

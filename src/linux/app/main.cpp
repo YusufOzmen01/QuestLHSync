@@ -43,6 +43,7 @@
 #include "../../driver/platform.h"
 #include "../../driver/sync.h"
 #include "../bridge.h"
+#include "../openhouse_room.h"
 #include "monado_link.h"
 #include "steamvr_tree.h"
 
@@ -249,6 +250,7 @@ class App {
   Settings set_;
   QlhsStatus *st_ = nullptr;
   bridge::Shm *br_ = nullptr;
+  bool room_ours_ = false;
   std::unique_ptr<HeadsetLink> link_;
   std::unique_ptr<MonadoLink> monado_;
   std::thread reader_;
@@ -335,11 +337,15 @@ class App {
       }
       if (d.cls == bridge::kStation) {
         if (!k.said && !serial.empty()) { Log(Fmt("device %d: lighthouse %s (base station)", i, serial.c_str())); k.said = true; }
-        if (d.channel != k.channel) {
-          if (d.channel) Log(Fmt("base station %s: channel %d", serial.c_str(), d.channel));
-          k.channel = d.channel;
+        // A 1.0 base station ("HTC V2-XD/XE") has no 2.0 channel: openhouse labels its multi-station
+        // slots "1".."4", and taken for 2.0 channels their rotor periods mixed the stations up
+        const bool v1 = model.rfind("HTC", 0) == 0;
+        const int channel = v1 ? 0 : d.channel;
+        if (channel != k.channel) {
+          if (channel) Log(Fmt("base station %s: channel %d", serial.c_str(), channel));
+          k.channel = channel;
         }
-        if (d.channel) chans[serial] = d.channel;
+        if (channel) chans[serial] = channel;
         if (d.has_pose) raw[serial] = {V3{d.p[0], d.p[1], d.p[2]}, ToM3(Quat{d.q[0], d.q[1], d.q[2], d.q[3]})};
       } else if (d.cls == bridge::kController || d.cls == bridge::kTracker) {
         if (!k.said && !serial.empty()) {
@@ -352,8 +358,61 @@ class App {
         }
       }
     }
+    OurRoom(raw);
     g_sync->SetStationsRaw(raw);
     g_sync->SetChannels(chans);
+  }
+
+  // openhouse (a replacement lighthouse driver) publishes its room: the stations as it has
+  // them now, whether they've stopped moving, and when they moved (openhouse_room.h). With it, the stations are its
+  // own and the solver waits while they settle; without (the stock driver), the runtime's devices as before.
+  void OurRoom(std::map<std::string, std::pair<V3, M3>> &raw) {
+    openhouse_room r;
+    bool ours = ReadOurRoom(r);
+    if (ours != room_ours_) {
+      room_ours_ = ours;
+      Log(ours ? Fmt("base stations: openhouse's room %s", r.room) : "base stations: the runtime's (no openhouse room)");
+    }
+    if (!ours) {
+      g_sync->SetRoomSource(false, true, 0);
+      return;
+    }
+    std::map<std::string, std::pair<V3, M3>> own;
+    for (int i = 0; i < r.count && i < OPENHOUSE_ROOM_MAX_BASES; i++) {
+      const openhouse_room_base &b = r.bases[i];
+      if (!b.visible || !b.placed) continue;
+      own[std::string(b.serial, strnlen(b.serial, sizeof b.serial))] = {V3{b.p[0], b.p[1], b.p[2]},
+                                                                        ToM3(Quat{b.q[0], b.q[1], b.q[2], b.q[3]})};
+    }
+    raw = own;
+    g_sync->SetRoomSource(true, r.settled != 0, r.epoch);
+  }
+
+  static bool ReadOurRoom(openhouse_room &out) {
+    std::string name = OPENHOUSE_ROOM_PATH_PREFIX + std::to_string((unsigned)getuid());
+    int fd = shm_open(name.c_str(), O_RDONLY, 0);
+    if (fd < 0) return false;
+    struct stat st {};
+    bool sized = fstat(fd, &st) == 0 && (size_t)st.st_size >= sizeof(openhouse_room);
+    void *m = sized ? mmap(nullptr, sizeof(openhouse_room), PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+    close(fd);
+    if (m == MAP_FAILED) return false;
+    const openhouse_room *r = (const openhouse_room *)m;
+    bool ok = false;
+    for (int tries = 0; tries < 8 && !ok; tries++) {
+      uint32_t s = __atomic_load_n(&r->seq, __ATOMIC_ACQUIRE);
+      if (s & 1) { std::this_thread::yield(); continue; }
+      memcpy(&out, r, sizeof out);
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      ok = __atomic_load_n(&r->seq, __ATOMIC_ACQUIRE) == s;
+    }
+    munmap(m, sizeof(openhouse_room));
+    if (!ok || out.magic != OPENHOUSE_ROOM_MAGIC || out.version != OPENHOUSE_ROOM_VERSION) return false;
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double mono = ts.tv_sec + 1e-9 * ts.tv_nsec;
+    out.room[sizeof out.room - 1] = 0;
+    return mono - out.beat < 2.0 && out.pid > 0 && kill(out.pid, 0) == 0;
   }
 
   // the runtime's headset: a Quest Pro, 3, 3S or a Steam Frame as WiVRn streams it (WiVRn names no model, so whichever
