@@ -190,6 +190,14 @@ Settings go in `~/.config/questlhsync/settings.json`, with the same keys as
 Windows. Levelling by gravity reads the lighthouse receivers' `/dev/hidraw`
 nodes, which Steam's udev rules (`steam-devices`) open to your user.
 
+A Quest Pro streamed over USB by
+QuestRawStream works too: its
+Monado driver is the only HMD (the lighthouse shim's headset is declined), and
+QuestLHSync treats it as a streamer, with its own learned pose timing. Its
+control app makes its Monado the active OpenXR runtime while streaming and
+restarts `questlhsync` so it picks up the matching libmonado (or set
+`LIBMONADO_PATH`).
+
 With a lighthouse headset (Index, Vive) or one Monado drives itself, QuestLHSync
 switches itself off, as on Windows. The Steam Frame streams through SteamVR
 only, so on Linux it's the Quests.

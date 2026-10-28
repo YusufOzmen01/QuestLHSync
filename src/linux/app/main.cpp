@@ -433,9 +433,14 @@ class App {
     std::string family;
     for (const std::string &p : {h.name, h.serial})
       if (family.empty()) family = QuestFamily(p);
+    // QuestRawStream (a Quest over USB, through its own Monado driver) streams like WiVRn: its pose timing is
+    // its own, so it is kept under its name rather than plain Monado's
+    std::string hl = h.name;
+    for (char &c : hl) c = (char)tolower((unsigned char)c);
+    if (hl.find("questrawstream") != std::string::npos) rt = "QuestRawStream";
     std::string lower = rt;
     for (char &c : lower) c = (char)tolower((unsigned char)c);
-    bool streamer = lower.find("wivrn") != std::string::npos;
+    bool streamer = lower.find("wivrn") != std::string::npos || lower.find("questrawstream") != std::string::npos;
     bool any = set_.any_hmd || streamer;
     {
       std::lock_guard<std::mutex> g(hmd_m_);
