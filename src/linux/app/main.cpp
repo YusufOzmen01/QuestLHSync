@@ -251,6 +251,7 @@ class App {
   QlhsStatus *st_ = nullptr;
   bridge::Shm *br_ = nullptr;
   bool room_ours_ = false;
+  std::string room_id_;  // openhouse's room the alignment belongs to
   std::unique_ptr<HeadsetLink> link_;
   std::unique_ptr<MonadoLink> monado_;
   std::thread reader_;
@@ -386,6 +387,24 @@ class App {
     }
     raw = own;
     g_sync->SetRoomSource(true, r.settled != 0, r.epoch);
+    // A different room (reset from openhouse's settings, its room file deleted, or the
+    // stations moved enough to start over): the alignment and the station places
+    // learned against the old one are wrong, so start over. Remembered across runs, so a
+    // room reset while we weren't running counts too.
+    const std::string id(r.room, strnlen(r.room, sizeof r.room));
+    if (!id.empty() && id != room_id_) {
+      const std::string path = plat::Join(plat::ConfigDir(), "openhouse_room");
+      if (room_id_.empty()) {
+        std::ifstream in(path);
+        std::getline(in, room_id_);
+      }
+      if (!room_id_.empty() && id != room_id_) {
+        Log(Fmt("openhouse room changed (%s -> %s): recalibrating", room_id_.c_str(), id.c_str()));
+        g_sync->ForceRecalibrate();
+      }
+      room_id_ = id;
+      std::ofstream(path) << id << "\n";
+    }
   }
 
   static bool ReadOurRoom(openhouse_room &out) {
