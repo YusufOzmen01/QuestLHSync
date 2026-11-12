@@ -252,6 +252,9 @@ class App {
   bridge::Shm *br_ = nullptr;
   bool room_ours_ = false;
   std::string room_id_;  // openhouse's room the alignment belongs to
+  std::map<std::string, std::pair<V3, M3>> room_ref_;  // the used stations' places the sightings are against
+  uint64_t room_epoch_ = 0;
+  double room_still_since_ = 0;
   std::unique_ptr<HeadsetLink> link_;
   std::unique_ptr<MonadoLink> monado_;
   std::thread reader_;
@@ -378,15 +381,41 @@ class App {
       g_sync->SetRoomSource(false, true, 0);
       return;
     }
+    // Only the well-placed stations: one openhouse is relearning (bumped, or barely seen) is
+    // placed with a large sigma and moves while it learns; with it in, its sightings were
+    // against a place still changing. openhouse's own settled/epoch cover every station,
+    // so one relearning station paused the alignment and dropped every sighting; here
+    // they're judged on the stations used only.
+    constexpr double kGoodSigma = 0.025;          // m
+    constexpr double kMovedM = 0.01, kMovedDeg = 0.3;  // a station this far off moved: older sightings are wrong
+    constexpr double kStillFor = 3.0;             // s the used stations must hold still
     std::map<std::string, std::pair<V3, M3>> own;
     for (int i = 0; i < r.count && i < OPENHOUSE_ROOM_MAX_BASES; i++) {
       const openhouse_room_base &b = r.bases[i];
-      if (!b.visible || !b.placed) continue;
+      if (!b.visible || !b.placed || !(b.sigma <= kGoodSigma)) continue;
       own[std::string(b.serial, strnlen(b.serial, sizeof b.serial))] = {V3{b.p[0], b.p[1], b.p[2]},
                                                                         ToM3(Quat{b.q[0], b.q[1], b.q[2], b.q[3]})};
     }
     raw = own;
-    g_sync->SetRoomSource(true, r.settled != 0, r.epoch);
+    const double now = QpcNow();
+    bool moved = false;
+    for (auto &kv : own) {
+      auto ref = room_ref_.find(kv.first);
+      if (ref == room_ref_.end()) continue;  // new to the alignment: nothing seen of it yet against another place
+      if (norm(kv.second.first - ref->second.first) > kMovedM ||
+          RotDeg(ref->second.second * T(kv.second.second)) > kMovedDeg)
+        moved = true;
+    }
+    for (auto &kv : own) room_ref_[kv.first] = kv.second;  // kept while a station drops out, to compare on return
+    if (moved) {
+      ++room_epoch_;
+      room_still_since_ = now;
+      Log(Fmt("openhouse station moved: epoch %llu", (unsigned long long)room_epoch_));
+    }
+    if (own.size() < 2) room_still_since_ = now;
+    if (room_epoch_ == 0 && own.size() >= 2) room_epoch_ = 1;
+    const bool settled = own.size() >= 2 && now - room_still_since_ >= kStillFor;
+    g_sync->SetRoomSource(true, settled, room_epoch_);
     // A different room (reset from openhouse's settings, its room file deleted, or the
     // stations moved enough to start over): the alignment and the station places
     // learned against the old one are wrong, so start over. Remembered across runs, so a

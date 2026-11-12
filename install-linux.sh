@@ -1,7 +1,9 @@
 #!/bin/sh
-# QuestLHSync for Linux (WiVRn / Monado): builds and installs it for your user. Needs cmake, a C++17 compiler, the
-# OpenXR loader (openxr) and GTK 3 (for the dashboard). SteamVR must be installed (its lighthouse driver is used).
-#   ./install-linux.sh             build, install to ~/.local/lib/questlhsync, start the questlhsync user service
+# QuestLHSync for Linux (WiVRn / Monado): installs it for your user. From a release package (lib/questlhsync next to
+# this script) it installs what's in it; from the source it builds first (needs cmake and a C++17 compiler). Either
+# way it needs the OpenXR loader (openxr) and GTK 3 (for the dashboard). SteamVR must be installed (its lighthouse
+# driver is used).
+#   ./install-linux.sh             install to ~/.local/lib/questlhsync, start the questlhsync user service
 #   ./install-linux.sh uninstall   remove all of that (your data in ~/.local/share/QuestLHSync stays)
 set -e
 cd "$(dirname "$0")"
@@ -24,11 +26,16 @@ if [ "$1" = uninstall ]; then
   exit 0
 fi
 
-GEN=""
-command -v ninja >/dev/null 2>&1 && GEN="-G Ninja"
-cmake -S . -B build/linux $GEN -DCMAKE_BUILD_TYPE=Release
-cmake --build build/linux
-cmake --install build/linux --prefix "$HOME/.local"
+if [ -d lib/questlhsync ]; then  # a release package: already built
+  mkdir -p "$LIB"
+  cp -a lib/questlhsync/. "$LIB/"
+else
+  GEN=""
+  command -v ninja >/dev/null 2>&1 && GEN="-G Ninja"
+  cmake -S . -B build/linux $GEN -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBDIR=lib
+  cmake --build build/linux
+  cmake --install build/linux --prefix "$HOME/.local"
+fi
 
 # the SteamVR tree the runtime loads the lighthouse shim from
 "$LIB/questlhsync" --setup >/dev/null
