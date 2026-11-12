@@ -29,7 +29,7 @@ namespace fs = std::filesystem;
 
 static const int W = 960, H = 660;  // page size at 96 dpi
 static double g_k = 1;                      // dpi scale
-static const wchar_t *RELEASES = L"https://github.com/CreoleVR/QuestLHSync/releases";
+static const wchar_t *RELEASES = L"https://github.com/YusufOzmen01/QuestLHSync/releases";
 
 // ---------------------------------------------------------------- drawing (same look as the dashboard page)
 struct Canvas {

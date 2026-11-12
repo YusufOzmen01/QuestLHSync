@@ -23,7 +23,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 APP_ID = "io.github.CreoleVR.QuestLHSync.Installer"
-LATEST = "https://api.github.com/repos/CreoleVR/QuestLHSync/releases/latest"
+LATEST = "https://api.github.com/repos/YusufOzmen01/QuestLHSync/releases/latest"
 FRAME_TAR = re.compile(r"(^|/)QuestLHSync-frame-[^/]*\.tar\.gz$")
 RELEASE_ZIP = re.compile(r"QuestLHSync-[^/]*\.zip$")
 # the Flatpak installs this file and frame/package/uninstall.sh in the same layout as the source tree
