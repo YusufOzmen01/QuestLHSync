@@ -10,7 +10,11 @@ extern void *memcpy(void *, const void *, unsigned long);
 extern int snprintf(char *, unsigned long, const char *, ...);
 #define MAXS 128
 #define MAXC 16                                // camera ids 0..15
-#define MAXB 48
+#define MAXB 96                                // blobs a frame reports at most (a sunlit room has many)
+#define KEEPPX 400                             // a blob this size or smaller may be a base station (sync.h kMaxPx)
+#define RUNMAX 16384                           // saturated runs a frame may have for the pixel-exact pass
+#define GAP 2                                  // px: saturated pixels this close (across or down) are one blob
+#define BIGSLOTS 8                             // of MAXB, kept for blobs bigger than KEEPPX (lamps, windows)
 #define MAXCELL 2048                           // 16x16 cells a frame may have for the dim pass
 #define OUTCAP (1 << 20)
 // Polling sleeps until shortly before a camera's next frame is due. Reading the camera buffers is slow, so checking
@@ -25,6 +29,10 @@ struct st {
   int thr;                                     // the dim pass's floor
   u8 hot[MAXCELL];                             // cells the dim pass leaves to the saturated one
   u8 *scratch; u16 *cells; int *lab;
+  u16 *run;                                    // saturated runs, 3 per run: y, x0, x1 (x1 past the last); RUNMAX
+  int *rlab, *rrow;                            // per run: its union-find parent; per row: its first run (h + 1)
+  u64 *rsx, *rsy; u32 *rnp; int *rbi;          // per root run: the blob's sums, pixels, its place in the output
+  int hist[KEEPPX + 2];                        // sat_blobs' blob sizes (no static data in a CModule: it isn't mapped)
   char *out; u32 head, tail, ndrop;
   u64 scan_ns; u32 nscan;
   u64 last_t[MAXC], due[MAXC]; u32 npoll;      // per camera: when its last frame was found, when to look for the next
@@ -47,6 +55,10 @@ extern struct st S;
 static u64 now(void) { struct ts t; clock_gettime(1, &t); return (u64)t.s * 1000000000ull + (u64)t.ns; }
 void set_bufs(u8 *scratch, u16 *cells, int *lab, char *out, int thr) {
   S.scratch = scratch; S.cells = cells; S.lab = lab; S.out = out; S.head = S.tail = 0; S.thr = thr;
+}
+// the pixel-exact saturated pass's buffers (lhsight.js); without them the cell pass does it, as it always did
+void set_runs(u16 *run, int *rlab, int *rrow, u64 *rsx, u64 *rsy, u32 *rnp, int *rbi) {
+  S.run = run; S.rlab = rlab; S.rrow = rrow; S.rsx = rsx; S.rsy = rsy; S.rnp = rnp; S.rbi = rbi;
 }
 void reset_slots(void) { S.nslots = 0; }
 void add_slot(u8 *p, int w, int h, int cam) {
@@ -190,6 +202,103 @@ static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *
   }
   return nbl;
 }
+// The saturated blobs, pixel-exact: runs of pixels >= T in each row, joined where they come within GAP px of each other
+// (across, or down to GAP rows). The cell pass joins whatever lies in neighbouring 16x16 cells, so in daylight a base
+// station's dot 10 px from a window, dark between them, came out as one blob the size of the window, too big to be a
+// dot. Here it's its own. Blobs that may be dots (KEEPPX px at most) are taken first, so a room full of glare doesn't
+// crowd them out of MAXB; then the biggest others (the PC watches lamps and windows to tell the head stands still).
+// Marks the cells under them and their neighbours hot, as the cell pass does. -1: more runs than RUNMAX (the cell pass
+// does it then)
+static int find_r(int x) { while (S.rlab[x] != x) { S.rlab[x] = S.rlab[S.rlab[x]]; x = S.rlab[x]; } return x; }
+static void join_r(int a, int b) { a = find_r(a); b = find_r(b); if (a != b) { if (a < b) S.rlab[b] = a; else S.rlab[a] = b; } }
+static int sat_blobs(int w, int h, int T, u64 *sx, u64 *sy, u32 *np, int *pk) {
+  int cw = w >> 4, ch = h >> 4, nr = 0;
+  if (!S.run || cw * ch > MAXCELL) return -1;
+  u64 add = 0x0101010101010101ull * (u64)(127 - (T - 1 > 127 ? 127 : T - 1));
+  for (int y = 0; y < h; y++) {
+    S.rrow[y] = nr;
+    const u8 *row = S.scratch + (u32)y * (u32)w;
+    int x = 0;
+    while (x < w) {
+      if (!(x & 7) && x + 8 <= w) {  // fast reject: no byte >= T in these 8
+        u64 v = *(const u64 *)(row + x);
+        if (!(((v + add) | v) & 0x8080808080808080ull)) { x += 8; continue; }
+      }
+      if (row[x] < T) { x++; continue; }
+      int x0 = x;
+      while (x < w && row[x] >= T) x++;
+      if (nr == RUNMAX) return -1;
+      u16 *r = S.run + 3 * nr;
+      r[0] = (u16)y; r[1] = (u16)x0; r[2] = (u16)x;
+      S.rlab[nr] = nr;
+      nr++;
+    }
+  }
+  S.rrow[h] = nr;
+  // join: a run with the run before it in its row, and with those of the GAP rows above that come within GAP px
+  for (int y = 0; y < h; y++)
+    for (int a = S.rrow[y]; a < S.rrow[y + 1]; a++) {
+      u16 *ra = S.run + 3 * a;
+      if (a > S.rrow[y] && ra[1] - S.run[3 * (a - 1) + 2] < GAP) join_r(a, a - 1);
+      for (int yy = y - 1; yy >= 0 && yy >= y - GAP; yy--)
+        for (int b = S.rrow[yy]; b < S.rrow[yy + 1]; b++) {
+          u16 *rb = S.run + 3 * b;
+          if (rb[1] >= ra[2] + GAP) break;  // runs in a row go left to right
+          if (rb[2] + GAP > ra[1]) join_r(a, b);
+        }
+    }
+  // the sums per blob (at its root run), and the cells it covers hot
+  for (int a = 0; a < nr; a++) { S.rnp[a] = 0; S.rsx[a] = S.rsy[a] = 0; S.rbi[a] = -1; }
+  for (int a = 0; a < nr; a++) {
+    u16 *r = S.run + 3 * a;
+    int root = find_r(a), y = r[0], len = r[2] - r[1];
+    S.rnp[root] += (u32)len;
+    S.rsy[root] += (u64)(y * 10 + 5) * (u64)len;
+    S.rsx[root] += (u64)len * (u64)(r[1] + r[2] - 1) * 5 + (u64)len * 5;  // sum of x * 10 + 5 over the run
+    int cy = y >> 4;
+    if (cy >= ch) continue;
+    for (int cx = r[1] >> 4; cx <= (r[2] - 1) >> 4 && cx < cw; cx++)
+      for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+          if (cy + dy >= 0 && cy + dy < ch && cx + dx >= 0 && cx + dx < cw) S.hot[(cy + dy) * cw + cx + dx] = 1;
+  }
+  // which blobs: those that may be dots, the biggest of them first (a base station's dot blooms over several pixels;
+  // sunlit sparkle and glints are a pixel or two, and come by the thousand through blinds), then the biggest others in
+  // the slots left, BIGSLOTS of them kept for those. By a histogram of the sizes: the size that fills the quota, then
+  // one pass
+  int nbl = 0;
+  for (int pass = 0; pass < 2; pass++) {
+    int quota = pass == 0 ? MAXB - BIGSLOTS : MAXB - nbl;
+    int *hist = S.hist;  // sizes 1..KEEPPX; KEEPPX + 1: all bigger (pass 1 by size buckets of 64 px)
+    for (int j = 0; j <= KEEPPX + 1; j++) hist[j] = 0;
+    for (int a = 0; a < nr; a++) {
+      if (S.rlab[a] != a || S.rbi[a] >= 0 || (S.rnp[a] <= KEEPPX) != !pass) continue;
+      int sz = pass == 0 ? (int)S.rnp[a] : 1 + (int)((S.rnp[a] - KEEPPX) >> 6);
+      hist[sz > KEEPPX + 1 ? KEEPPX + 1 : sz]++;
+    }
+    int cut = KEEPPX + 1, got = 0;  // take sizes >= cut, and some of cut itself
+    for (; cut > 0 && got + hist[cut] <= quota; cut--) got += hist[cut];
+    int at_cut = quota - got;
+    for (int a = 0; a < nr && nbl < MAXB; a++) {
+      if (S.rlab[a] != a || S.rbi[a] >= 0 || (S.rnp[a] <= KEEPPX) != !pass) continue;
+      int sz = pass == 0 ? (int)S.rnp[a] : 1 + (int)((S.rnp[a] - KEEPPX) >> 6);
+      if (sz > KEEPPX + 1) sz = KEEPPX + 1;
+      if (sz < cut || (sz == cut && at_cut-- <= 0)) continue;
+      S.rbi[a] = nbl;
+      sx[nbl] = S.rsx[a]; sy[nbl] = S.rsy[a]; np[nbl] = S.rnp[a]; pk[nbl] = 0;
+      nbl++;
+    }
+  }
+  // their peaks
+  for (int a = 0; a < nr; a++) {
+    int bi = S.rbi[find_r(a)];
+    if (bi < 0) continue;
+    u16 *r = S.run + 3 * a;
+    const u8 *row = S.scratch + (u32)r[0] * (u32)w;
+    for (int x = r[1]; x < r[2]; x++) if (row[x] > pk[bi]) pk[bi] = row[x];
+  }
+  return nbl;
+}
 static void frame(int i, u64 t) {
   int w = S.sw[i], h = S.sh[i], c = S.cam[i];
   // a gap this long (frames come at most 39 ms apart) could have let a frame go by unseen: the count's place is lost
@@ -246,7 +355,7 @@ static void frame(int i, u64 t) {
   // the odd place, else a held place, before the cycle test: found late, it names the wrong frame now and then
   int place = oddp >= 0 ? p == oddp : S.phn[c] >= PH_LOCK ? p == S.ph[c] : -1;
   int is_short = strict || (place >= 0 ? place : cyc >= 0 ? cyc : alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
-  char line[2400]; int L;
+  char line[4096]; int L;
   if (!is_short) {
     L = snprintf(line, sizeof line, "F %d %u %llu %d -1\n", c, k, t / 1000, mean);
     put(line, L);
@@ -260,11 +369,15 @@ static void frame(int i, u64 t) {
   int cw = w >> 4, ch = h >> 4, nc = cw * ch, T = mean * 4 / 10;
   if (T < S.thr) T = S.thr;
   for (int q = 0; q < nc && q < MAXCELL; q++) S.hot[q] = 0;
-  int nbl = blobs(w, h, 250, 1, 0, sx, sy, np, pk);
+  int nbl = sat_blobs(w, h, 250, sx, sy, np, pk);
+  if (nbl < 0) {
+    for (int q = 0; q < nc && q < MAXCELL; q++) S.hot[q] = 0;
+    nbl = blobs(w, h, 250, 1, 0, sx, sy, np, pk);
+  }
   if (T < 250 && nc <= MAXCELL) nbl = blobs(w, h, T, 0, nbl, sx, sy, np, pk);
   S.scan_ns += now() - t0; S.nscan++;
   L = snprintf(line, sizeof line, "F %d %u %llu %d %d", c, k, t / 1000, mean, nbl);
-  for (int e = 0; e < nbl && L < (int)sizeof line - 40; e++)
+  for (int e = 0; e < nbl && L < (int)sizeof line - 48; e++)
     L += snprintf(line + L, sizeof line - L, " %llu %llu %u %d", sx[e] / np[e], sy[e] / np[e], np[e], pk[e]);
   line[L++] = '\n';
   put(line, L);
