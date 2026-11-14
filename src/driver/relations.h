@@ -20,8 +20,8 @@ class Relations {
  public:
   Relations(std::string dir, LogFn log);
   void SetEnabled(bool on) { enabled_ = on; }
-  // hooks driver_lighthouse.dll's relationship step (MinHook initialised). True once there's nothing more to try
-  // (hooked, or code this doesn't know), false while that DLL isn't loaded yet
+  // hooks driver_lighthouse.dll's relationship step (MinHook initialised; on Linux driver_lighthouse.so's, by the
+  // shim). True once there's nothing more to try (hooked, or code this doesn't know), false while it isn't loaded yet
   bool Hook();
   void Unhook();
   // SteamVR's relationship of stations a and b (qx qy qz qw tx ty tz; a = rel * b) -> out, the one it gets instead;
@@ -34,7 +34,7 @@ class Relations {
   struct Pose { Quat q; V3 t; };
   static Pose Inv(const Pose &p);
   static Pose Mean(const std::vector<Pose> &v);
-  // the relationship step in a loaded driver_lighthouse.dll, or null and why
+  // the relationship step in a loaded driver_lighthouse.dll (its module; on Linux an Image), or null and why
   static void *Find(void *module, std::string &why);
 
  private:
