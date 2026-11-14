@@ -2,6 +2,14 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <thread>
 #endif
 
 #include <cstdio>
@@ -46,9 +54,28 @@ static bool ReadRoom(openhouse_room &out, double now) {
   CloseHandle(p);
   return alive;
 #else
-  (void)out;
-  (void)now;
-  return false;
+  const std::string name = OPENHOUSE_ROOM_PATH_PREFIX + std::to_string((unsigned)getuid());
+  int fd = shm_open(name.c_str(), O_RDONLY, 0);
+  if (fd < 0) return false;
+  struct stat st {};
+  bool sized = fstat(fd, &st) == 0 && (size_t)st.st_size >= sizeof(openhouse_room);
+  void *m = sized ? mmap(nullptr, sizeof(openhouse_room), PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+  close(fd);
+  if (m == MAP_FAILED) return false;
+  const openhouse_room *r = (const openhouse_room *)m;
+  bool ok = false;
+  for (int tries = 0; tries < 8 && !ok; tries++) {
+    uint32_t s = __atomic_load_n(&r->seq, __ATOMIC_ACQUIRE);
+    if (s & 1) { std::this_thread::yield(); continue; }
+    memcpy(&out, r, sizeof out);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    ok = __atomic_load_n(&r->seq, __ATOMIC_ACQUIRE) == s;
+  }
+  munmap(m, sizeof(openhouse_room));
+  if (!ok || out.magic != OPENHOUSE_ROOM_MAGIC || out.version != OPENHOUSE_ROOM_VERSION) return false;
+  out.room[sizeof out.room - 1] = 0;
+  // beat: CLOCK_MONOTONIC seconds, as QpcNow
+  return out.beat != 0 && now - out.beat < 2.0 && out.pid > 0 && kill(out.pid, 0) == 0;
 #endif
 }
 

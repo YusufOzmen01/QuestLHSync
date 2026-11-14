@@ -2714,7 +2714,11 @@ void Sync::Retime(double old_e, double new_e) {
 static std::string Join(const std::string &dir, const char *name) {
   if (dir.empty()) return name;
   char e = dir.back();
+#ifdef _WIN32
   return dir + ((e == '\\' || e == '/') ? "" : "\\") + name;
+#else
+  return dir + (e == '/' ? "" : "/") + name;
+#endif
 }
 
 static StationsFile LoadStations(const std::string &dir) {
@@ -2836,6 +2840,8 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   std::lock_guard<std::mutex> g(net_);
   if (!optics_.Load(json, err)) return false;
   have_optics_ = true;
+  // kept for offline replays: qlhs_replay --calib needs the headset's own calibration, which only the headset has
+  if (!cfg_.dir.empty()) WriteFileAtomic((std::filesystem::path(cfg_.dir) / "last_calibration.json").string(), json);
   std::string left_out = optics_.Unused();
   if (!left_out.empty()) log_("cameras " + left_out + " left out: they look down, the base stations hang above");
   // a Quest's frame period is one of two, the other headsets' are learned from their frames
@@ -2918,7 +2924,11 @@ void Sync::ApplyHeadset() {
     std::lock_guard<std::mutex> g(st_m_);
     ApplyTiming();
   }
+#ifdef _WIN32
   log_(Fmt("state for %s: headsets\\%s\\state.json%s", key.c_str(), key.c_str(),
+#else
+  log_(Fmt("state for %s: headsets/%s/state.json%s", key.c_str(), key.c_str(),
+#endif
            adopted ? " (the state.json of earlier versions, moved there)"
                    : quest_.empty() ? " (nothing saved yet)" : Fmt(" (%d base stations saved)", (int)quest_.size()).c_str()));
 }
